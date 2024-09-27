@@ -14,6 +14,13 @@ enum Command {
     Build,
     /// Clean the local site directory.
     Clean,
+    /// Upload an asset.
+    Upload {
+        /// Local path to the asset to upload.
+        path: std::path::PathBuf,
+        /// S3 key string. If omitted, a default will be used (something like "uploads/filename.extension")
+        key: Option<String>,
+    },
 }
 
 #[derive(
@@ -75,10 +82,10 @@ struct Cli {
 }
 
 fn get_files(dir: impl AsRef<std::path::Path>) -> Vec<std::path::PathBuf> {
-    log::trace!("reading {}", dir.as_ref().display());
+    log::info!("reading directory '{}'", dir.as_ref().display());
     if !(dir.as_ref().exists() && dir.as_ref().is_dir()) {
         log::error!(
-            "{} does not exist, or is not a directory",
+            "'{}' does not exist, or is not a directory",
             dir.as_ref().display()
         );
         panic!("not a dir");
@@ -114,9 +121,24 @@ fn pop_parent_replace_ext(
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub enum PageSource {
+    Remote(String),
+    Local(std::path::PathBuf),
+}
+
+impl PageSource {
+    pub fn as_str(&self) -> &str {
+        match self {
+            PageSource::Remote(s) => s.as_str(),
+            PageSource::Local(p) => p.to_str().unwrap(),
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ExternalPage {
     /// URL source of the md file
-    pub source_url: String,
+    pub source_url: PageSource,
     /// Local path to host the resulting index.html
     pub local_path: std::path::PathBuf,
 }
@@ -193,14 +215,60 @@ impl SiteManifest {
             local_path,
         } = external;
         let built_filepath = self.build_directory.join(&local_path);
-        let content = String::from_utf8(
-            std::process::Command::new("curl")
-                .arg(&source_url)
-                .output()
-                .expect("could not curl the devlog")
-                .stdout,
-        )
-        .unwrap();
+        let (content, origin_modified) = match &source_url {
+            PageSource::Remote(url) => {
+                let content = String::from_utf8(
+                    std::process::Command::new("curl")
+                        .arg(url)
+                        .output()
+                        .expect("could not curl the devlog")
+                        .stdout,
+                )
+                .unwrap();
+                let head = String::from_utf8(
+                    std::process::Command::new("curl")
+                        .arg("--head")
+                        .arg(url)
+                        .output()
+                        .expect("could not curl the devlog")
+                        .stdout,
+                )
+                .unwrap();
+                log::info!("devlog: {head}");
+
+                let headers = head
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .collect::<HashMap<_, _>>();
+                let origin_modified = match headers.get("date") {
+                    None => {
+                        log::warn!("headers did not contain 'date'");
+                        chrono::Utc::now().fixed_offset()
+                    }
+                    Some(d) => {
+                        log::debug!("date: {d}");
+                        match chrono::DateTime::parse_from_rfc2822(d) {
+                            Err(e) => {
+                                log::error!("could not parse date: {e}");
+                                chrono::Utc::now().fixed_offset()
+                            }
+                            Ok(d) => d,
+                        }
+                    }
+                };
+                (content, origin_modified)
+            }
+            PageSource::Local(path) => {
+                let mut file = std::fs::File::open(path).unwrap();
+                let origin_modified = chrono::DateTime::<chrono::Utc>::from(
+                    file.metadata().unwrap().modified().unwrap(),
+                )
+                .fixed_offset();
+                let mut content = String::new();
+                file.read_to_string(&mut content).unwrap();
+                (content, origin_modified)
+            }
+        };
 
         log::trace!("rendering the devlog to {}", built_filepath.display());
         let page_string = R::render_content(cfg, self.environment, content, "devlog").unwrap();
@@ -211,42 +279,10 @@ impl SiteManifest {
         std::fs::write(&built_filepath, page_string).unwrap();
         log::trace!("  done!");
 
-        let head = String::from_utf8(
-            std::process::Command::new("curl")
-                .arg("--head")
-                .arg(&source_url)
-                .output()
-                .expect("could not curl the devlog")
-                .stdout,
-        )
-        .unwrap();
-        log::info!("devlog: {head}");
-
-        let headers = head
-            .lines()
-            .filter_map(|line| line.split_once(':'))
-            .collect::<HashMap<_, _>>();
-        let origin_modified = match headers.get("date") {
-            None => {
-                log::warn!("headers did not contain 'date'");
-                chrono::Utc::now().fixed_offset()
-            }
-            Some(d) => {
-                log::debug!("date: {d}");
-                match chrono::DateTime::parse_from_rfc2822(d) {
-                    Err(e) => {
-                        log::error!("could not parse date: {e}");
-                        chrono::Utc::now().fixed_offset()
-                    }
-                    Ok(d) => d,
-                }
-            }
-        };
-
         self.files.insert(
-            source_url.clone(),
+            source_url.as_str().to_owned(),
             ManifestFile {
-                origin: source_url,
+                origin: source_url.as_str().to_owned(),
                 origin_modified,
                 destination: local_path,
                 built_filepath,
@@ -348,21 +384,61 @@ impl SiteManifest {
         log::info!("build manifest saved to '{manifest_path}'");
     }
 
+    /// Upload one asset.
+    async fn upload(&self, cfg: &SiteConfig, path: std::path::PathBuf, key: String) {
+        let bucket = if let Some(b) = (cfg.s3_bucket)(self.environment) {
+            b
+        } else {
+            log::error!("asset cannot be uploaded to a local environment");
+            panic!("environment error");
+        };
+
+        let config = aws_config::load_from_env()
+            .await
+            .to_builder()
+            .region(aws_config::Region::new("us-west-1"))
+            .build();
+        let s3 = aws_sdk_s3::Client::new(&config);
+        let content_type = new_mime_guess::from_path(&path).first_or_octet_stream();
+        log::info!("uploading '{bucket}' '{key}' as {content_type}");
+        let result = s3
+            .put_object()
+            .bucket(bucket)
+            .key(&key)
+            .content_type(content_type.essence_str())
+            .body(
+                aws_sdk_s3::primitives::ByteStream::from_path(&path)
+                    .await
+                    .unwrap(),
+            )
+            .send()
+            .await;
+        if let Err(e) = result {
+            log::error!("{e}");
+            panic!("s3 upload failed: {e:#?}");
+        }
+
+        log::info!("uploaded: {}/{key}", (cfg.root_url)(self.environment));
+    }
+
     async fn deploy<R: Renderer>(
         &mut self,
         cfg: &SiteConfig,
         external_pages: impl IntoIterator<Item = ExternalPage>,
     ) {
-        let bucket = if let Some(b) = (cfg.s3_bucket)(self.environment) {
-            b
-        } else {
-            log::error!("local environment cannot be deployed");
-            panic!("environment error");
-        };
-
         log::info!(
-            "deploying '{}' to bucket '{bucket}'",
-            self.build_directory.display(),
+            "deploying with configuration: {:#?}",
+            [
+                ("root url", (cfg.root_url)(self.environment)),
+                (
+                    "s3 bucket",
+                    (cfg.s3_bucket)(self.environment).unwrap_or("(none)")
+                ),
+                (
+                    "cloudfront distribution",
+                    (cfg.cloudfront_distro)(self.environment).unwrap_or("(none)")
+                ),
+            ]
         );
 
         self.build::<R>(cfg, external_pages);
@@ -372,28 +448,9 @@ impl SiteManifest {
             .to_builder()
             .region(aws_config::Region::new("us-west-1"))
             .build();
-        let s3 = aws_sdk_s3::Client::new(&config);
         for mfile in self.files.values() {
             let key = format!("{}", mfile.destination.display());
-            let content_type =
-                new_mime_guess::from_path(&mfile.destination).first_or_octet_stream();
-            log::info!("uploading '{bucket}' '{key}' as {content_type}");
-            let result = s3
-                .put_object()
-                .bucket(bucket)
-                .key(key)
-                .content_type(content_type.essence_str())
-                .body(
-                    aws_sdk_s3::primitives::ByteStream::from_path(&mfile.built_filepath)
-                        .await
-                        .unwrap(),
-                )
-                .send()
-                .await;
-            if let Err(e) = result {
-                log::error!("{e}");
-                panic!("s3 upload failed: {e:#?}");
-            }
+            self.upload(cfg, mfile.built_filepath.clone(), key).await;
         }
 
         log::info!("done uploading to s3, invalidating the cloudfront cache");
@@ -446,23 +503,34 @@ pub async fn run<R: Renderer>(
     cfg: &SiteConfig,
     external_pages: impl IntoIterator<Item = ExternalPage>,
 ) {
-    env_logger::builder()
-        .filter_module("rustls", log::LevelFilter::Warn)
-        .filter_module("hyper_rustls", log::LevelFilter::Warn)
-        .init();
+    env_logger::builder().init();
 
     let cli = Cli::parse();
 
     let mut manifest = SiteManifest::new(cli.environment, cli.build_directory.into());
-    log::info!("starting manifest: {manifest:#?}");
 
     match cli.cmd {
-        Command::Deploy => manifest.deploy::<R>(cfg, external_pages).await,
+        Command::Deploy => {
+            manifest.deploy::<R>(cfg, external_pages).await;
+            log::info!("manifest: {manifest:#?}");
+        }
         Command::Build => manifest.build::<R>(cfg, external_pages),
         Command::Clean => manifest.clean(),
+        Command::Upload { path, key } => {
+            let key = key.unwrap_or_else(|| {
+                let filename = path.file_name().unwrap().to_string_lossy().to_string();
+                format!(
+                    "uploads/{}",
+                    filename
+                        .replace(" ", "_")
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .concat()
+                )
+            });
+            manifest.upload(cfg, path, key).await
+        }
     }
-
-    log::info!("ending manifest: {manifest:#?}");
 }
 
 #[cfg(test)]
