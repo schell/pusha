@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    io::Read,
+    io::{Read, Write},
     str::FromStr,
 };
 
@@ -15,12 +15,7 @@ enum Command {
     /// Clean the local site directory.
     Clean,
     /// Upload an asset.
-    Upload {
-        /// Local path to the asset to upload.
-        path: std::path::PathBuf,
-        /// S3 key string. If omitted, a default will be used (something like "uploads/filename.extension")
-        key: Option<String>,
-    },
+    Upload,
 }
 
 #[derive(
@@ -385,7 +380,7 @@ impl SiteManifest {
     }
 
     /// Upload one asset.
-    async fn upload(&self, cfg: &SiteConfig, path: std::path::PathBuf, key: String) {
+    async fn upload(&self, cfg: &SiteConfig, path: std::path::PathBuf, key: String) -> String {
         let bucket = if let Some(b) = (cfg.s3_bucket)(self.environment) {
             b
         } else {
@@ -400,7 +395,16 @@ impl SiteManifest {
             .build();
         let s3 = aws_sdk_s3::Client::new(&config);
         let content_type = new_mime_guess::from_path(&path).first_or_octet_stream();
-        log::info!("uploading '{bucket}' '{key}' as {content_type}");
+        log::info!("uploading path '{}'\n  to bucket '{bucket}'\n  as key '{key}'\n  with ctype '{content_type}'", path.display());
+
+        if !path.is_file() {
+            log::error!("'{}' is not a file", path.display());
+            if !path.exists() {
+                log::error!("'{}' does not exist", path.display());
+            }
+            panic!("could not upload asset");
+        }
+
         let result = s3
             .put_object()
             .bucket(bucket)
@@ -418,7 +422,10 @@ impl SiteManifest {
             panic!("s3 upload failed: {e:#?}");
         }
 
-        log::info!("uploaded: {}/{key}", (cfg.root_url)(self.environment));
+        let path_key = format!("{}/{key}", (cfg.root_url)(self.environment));
+        log::info!("uploaded: {path_key}");
+
+        path_key
     }
 
     async fn deploy<R: Renderer>(
@@ -516,20 +523,55 @@ pub async fn run<R: Renderer>(
         }
         Command::Build => manifest.build::<R>(cfg, external_pages),
         Command::Clean => manifest.clean(),
-        Command::Upload { path, key } => {
-            let key = key.unwrap_or_else(|| {
+        Command::Upload => loop {
+            print!("awaiting file to upload: ");
+            let _ = std::io::stdout().flush();
+            let mut path_string = String::new();
+            std::io::stdin().read_line(&mut path_string).unwrap();
+            let path_string = path_string.trim_start().trim_end().replace("\\", "");
+            log::info!("got path: '{path_string}'");
+            let path = std::path::PathBuf::from(path_string);
+            fn descend(path: impl AsRef<std::path::Path>) -> Vec<std::path::PathBuf> {
+                let mut paths = vec![];
+                if path.as_ref().is_dir() {
+                    log::debug!("reading {}", path.as_ref().display());
+                    for entry in std::fs::read_dir(path.as_ref()).unwrap() {
+                        let entry = entry.unwrap();
+                        let path = entry.path();
+                        log::debug!("  saw {}", path.display());
+                        paths.extend(descend(path));
+                    }
+                } else {
+                    paths.push(path.as_ref().to_path_buf());
+                }
+                paths
+            }
+
+            let prefix = format!(
+                "{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+            );
+            let mut path_keys = vec![];
+            for path in descend(path).into_iter() {
                 let filename = path.file_name().unwrap().to_string_lossy().to_string();
-                format!(
-                    "uploads/{}",
+                let key = format!(
+                    "uploads/{prefix}/{}",
                     filename
-                        .replace(" ", "_")
+                        .replace(' ', "_")
                         .split_whitespace()
                         .collect::<Vec<_>>()
                         .concat()
-                )
-            });
-            manifest.upload(cfg, path, key).await
-        }
+                );
+
+                path_keys.push(manifest.upload(cfg, path, key).await);
+            }
+
+            path_keys.sort();
+            path_keys.into_iter().for_each(|pk| println!("{pk}"));
+        },
     }
 }
 
