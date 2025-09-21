@@ -11,7 +11,9 @@ chrono = { version = "0.4.38", features = ["serde"] }
 clap = { version = "4.5.7", features = ["derive"] }
 env_logger = "0.11.3"
 log = "0.4.21"
+md5 = "0.8.0"
 new_mime_guess = "4.0.1"
+pretty_assertions = "1.4.1"
 serde = { version = "1.0.203", features = ["derive"] }
 serde_yaml = "0.9.34"
 snafu = "0.8.3"

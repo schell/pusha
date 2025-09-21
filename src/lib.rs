@@ -7,7 +7,7 @@ use std::{
 use clap::{Parser, ValueEnum};
 
 #[derive(clap::Subcommand)]
-enum Command {
+pub enum Command {
     /// Deploy the site from the `site` directory.
     Deploy,
     /// Build the site locally, compiling templates and content into the `site` directory.
@@ -60,20 +60,24 @@ impl FromStr for Environment {
     }
 }
 
+pub fn md5_bytes(input: &[u8]) -> [u8; 16] {
+    md5::compute(input).0
+}
+
 #[derive(Parser)]
 #[clap(author, version, about)]
-struct Cli {
+pub struct PushaCli {
     /// The deployment environment. Should be "local", "staging" or "production".
     #[clap(long, short = 'e', default_value = "local")]
-    environment: Environment,
+    pub environment: Environment,
 
     /// The local build directory.
     #[clap(long, short = 'b', default_value = "site")]
-    build_directory: String,
+    pub build_directory: String,
 
     /// Subcommand
     #[clap(subcommand)]
-    cmd: Command,
+    pub cmd: Command,
 }
 
 fn get_files(dir: impl AsRef<std::path::Path>) -> Vec<std::path::PathBuf> {
@@ -163,12 +167,38 @@ pub trait Renderer {
     ) -> Result<String, Self::Error>;
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ManifestFile {
     origin: String,
     origin_modified: chrono::DateTime<chrono::FixedOffset>,
     built_filepath: std::path::PathBuf,
+    md5_hash: Option<[u8; 16]>,
     destination: std::path::PathBuf,
+
+    /// Whether or not the file still exists.
+    ///
+    /// This does not get saved to the manifest, so for this to be `true`, the file must
+    /// exist on the filesystem and be built.
+    #[serde(skip)]
+    exists: bool,
+    #[serde(skip)]
+    has_changed: bool,
+}
+
+impl ManifestFile {
+    pub fn set_md5(&mut self, input: &[u8]) {
+        let input = md5_bytes(input);
+        self.has_changed = self.md5_hash.is_none() || self.md5_hash.unwrap() != input;
+        if self.has_changed {
+            log::info!(
+                "{} has changed\nprevious: {:?}\ncurrent: {:?}",
+                self.destination.display(),
+                self.md5_hash,
+                input
+            );
+        }
+        self.md5_hash = Some(input);
+    }
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -201,7 +231,6 @@ impl SiteManifest {
         }
         log::debug!("creating build dir '{}'", self.build_directory.display());
         std::fs::create_dir_all(&self.build_directory).unwrap();
-        self.files = Default::default();
     }
 
     fn build_external<R: Renderer>(&mut self, cfg: &SiteConfig, external: ExternalPage) {
@@ -271,18 +300,17 @@ impl SiteManifest {
         if let Some(parent) = built_filepath.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
-        std::fs::write(&built_filepath, page_string).unwrap();
+        std::fs::write(&built_filepath, &page_string).unwrap();
         log::trace!("  done!");
 
-        self.files.insert(
-            source_url.as_str().to_owned(),
-            ManifestFile {
-                origin: source_url.as_str().to_owned(),
-                origin_modified,
-                destination: local_path,
-                built_filepath,
-            },
-        );
+        let key = source_url.as_str();
+        let file = self.files.entry(key.to_string()).or_default();
+        file.origin = source_url.as_str().to_owned();
+        file.origin_modified = origin_modified;
+        file.built_filepath = built_filepath;
+        file.set_md5(page_string.as_bytes());
+        file.destination = local_path;
+        file.exists = true;
     }
 
     fn build<R: Renderer>(
@@ -327,18 +355,16 @@ impl SiteManifest {
             if let Some(parent) = built_filepath.parent() {
                 std::fs::create_dir_all(parent).unwrap();
             }
-            std::fs::write(&built_filepath, page_string).unwrap();
+            std::fs::write(&built_filepath, &page_string).unwrap();
             log::trace!("  done!");
 
-            self.files.insert(
-                origin.clone(),
-                ManifestFile {
-                    origin,
-                    origin_modified,
-                    destination,
-                    built_filepath,
-                },
-            );
+            let file = self.files.entry(origin.clone()).or_default();
+            file.origin = origin;
+            file.origin_modified = origin_modified;
+            file.built_filepath = built_filepath;
+            file.set_md5(page_string.as_bytes());
+            file.destination = destination;
+            file.exists = true;
         }
 
         for file in other_files {
@@ -360,18 +386,25 @@ impl SiteManifest {
             let mut bytes = vec![];
             let _ = file.read_to_end(&mut bytes).unwrap();
 
-            std::fs::write(&built_filepath, bytes).unwrap();
+            std::fs::write(&built_filepath, &bytes).unwrap();
 
-            self.files.insert(
-                origin.clone(),
-                ManifestFile {
-                    origin,
-                    origin_modified,
-                    built_filepath,
-                    destination,
-                },
-            );
+            let file = self.files.entry(origin.clone()).or_default();
+            file.origin = origin;
+            file.origin_modified = origin_modified;
+            file.built_filepath = built_filepath;
+            file.set_md5(&bytes);
+            file.destination = destination;
+            file.exists = true;
         }
+        self.files.retain(|_, file| {
+            if !file.exists {
+                log::warn!(
+                    "removing missing file {} from the manifest",
+                    file.destination.display()
+                );
+            }
+            file.exists
+        });
 
         let manifest_string = serde_yaml::to_string(&self).unwrap();
         let manifest_path = format!("{}.yaml", self.environment);
@@ -455,9 +488,16 @@ impl SiteManifest {
             .to_builder()
             .region(aws_config::Region::new("us-west-1"))
             .build();
-        for mfile in self.files.values() {
+        let mut invalidate_paths = vec![];
+        for mfile in self.files.clone().values() {
             let key = format!("{}", mfile.destination.display());
-            self.upload(cfg, mfile.built_filepath.clone(), key).await;
+            if mfile.has_changed {
+                log::info!("{}:\nhas changed", mfile.destination.display(),);
+                self.upload(cfg, mfile.built_filepath.clone(), key).await;
+                invalidate_paths.push(mfile.destination.clone());
+            } else {
+                log::debug!("{} has not changed, skipping", mfile.destination.display());
+            }
         }
 
         log::info!("done uploading to s3, invalidating the cloudfront cache");
@@ -470,10 +510,9 @@ impl SiteManifest {
         )
         .expect("not utf8");
         let cf = aws_sdk_cloudfront::Client::new(&config);
-        let paths = self
-            .files
-            .values()
-            .map(|mf| format!("/{}", mf.destination.display()))
+        let paths = invalidate_paths
+            .into_iter()
+            .map(|path| format!("/{}", path.display()))
             .collect::<Vec<_>>();
         log::debug!("paths: {paths:#?}");
         let result = cf
@@ -495,8 +534,8 @@ impl SiteManifest {
             .send()
             .await;
         match result {
-            Ok(invalidation) => {
-                log::info!("created invalidation: {invalidation:#?}");
+            Ok(_invalidation) => {
+                log::info!("created invalidation");
             }
             Err(e) => {
                 log::error!("{e}");
@@ -506,73 +545,78 @@ impl SiteManifest {
     }
 }
 
+impl PushaCli {
+    pub async fn run<R: Renderer>(
+        &self,
+        cfg: &SiteConfig,
+        external_pages: impl IntoIterator<Item = ExternalPage>,
+    ) {
+        let mut manifest = SiteManifest::new(self.environment, self.build_directory.clone().into());
+
+        match self.cmd {
+            Command::Deploy => manifest.deploy::<R>(cfg, external_pages).await,
+            Command::Build => manifest.build::<R>(cfg, external_pages),
+            Command::Clean => manifest.clean(),
+            Command::Upload => loop {
+                print!("awaiting file to upload: ");
+                let _ = std::io::stdout().flush();
+                let mut path_string = String::new();
+                std::io::stdin().read_line(&mut path_string).unwrap();
+                let path_string = path_string.trim_start().trim_end().replace("\\", "");
+                log::info!("got path: '{path_string}'");
+                let path = std::path::PathBuf::from(path_string);
+                fn descend(path: impl AsRef<std::path::Path>) -> Vec<std::path::PathBuf> {
+                    let mut paths = vec![];
+                    if path.as_ref().is_dir() {
+                        log::debug!("reading {}", path.as_ref().display());
+                        for entry in std::fs::read_dir(path.as_ref()).unwrap() {
+                            let entry = entry.unwrap();
+                            let path = entry.path();
+                            log::debug!("  saw {}", path.display());
+                            paths.extend(descend(path));
+                        }
+                    } else {
+                        paths.push(path.as_ref().to_path_buf());
+                    }
+                    paths
+                }
+
+                let prefix = format!(
+                    "{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                );
+                let mut path_keys = vec![];
+                for path in descend(path).into_iter() {
+                    let filename = path.file_name().unwrap().to_string_lossy().to_string();
+                    let key = format!(
+                        "uploads/{prefix}/{}",
+                        filename
+                            .replace(' ', "_")
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .concat()
+                    );
+
+                    path_keys.push(manifest.upload(cfg, path, key).await);
+                }
+
+                path_keys.sort();
+                path_keys.into_iter().for_each(|pk| println!("{pk}"));
+            },
+        }
+    }
+}
+
 pub async fn run<R: Renderer>(
     cfg: &SiteConfig,
     external_pages: impl IntoIterator<Item = ExternalPage>,
 ) {
-    env_logger::builder().init();
-
-    let cli = Cli::parse();
-
-    let mut manifest = SiteManifest::new(cli.environment, cli.build_directory.into());
-
-    match cli.cmd {
-        Command::Deploy => {
-            manifest.deploy::<R>(cfg, external_pages).await;
-            log::info!("manifest: {manifest:#?}");
-        }
-        Command::Build => manifest.build::<R>(cfg, external_pages),
-        Command::Clean => manifest.clean(),
-        Command::Upload => loop {
-            print!("awaiting file to upload: ");
-            let _ = std::io::stdout().flush();
-            let mut path_string = String::new();
-            std::io::stdin().read_line(&mut path_string).unwrap();
-            let path_string = path_string.trim_start().trim_end().replace("\\", "");
-            log::info!("got path: '{path_string}'");
-            let path = std::path::PathBuf::from(path_string);
-            fn descend(path: impl AsRef<std::path::Path>) -> Vec<std::path::PathBuf> {
-                let mut paths = vec![];
-                if path.as_ref().is_dir() {
-                    log::debug!("reading {}", path.as_ref().display());
-                    for entry in std::fs::read_dir(path.as_ref()).unwrap() {
-                        let entry = entry.unwrap();
-                        let path = entry.path();
-                        log::debug!("  saw {}", path.display());
-                        paths.extend(descend(path));
-                    }
-                } else {
-                    paths.push(path.as_ref().to_path_buf());
-                }
-                paths
-            }
-
-            let prefix = format!(
-                "{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-            );
-            let mut path_keys = vec![];
-            for path in descend(path).into_iter() {
-                let filename = path.file_name().unwrap().to_string_lossy().to_string();
-                let key = format!(
-                    "uploads/{prefix}/{}",
-                    filename
-                        .replace(' ', "_")
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .concat()
-                );
-
-                path_keys.push(manifest.upload(cfg, path, key).await);
-            }
-
-            path_keys.sort();
-            path_keys.into_iter().for_each(|pk| println!("{pk}"));
-        },
-    }
+    let _ = env_logger::builder().try_init();
+    let cli = PushaCli::parse();
+    cli.run::<R>(cfg, external_pages).await
 }
 
 #[cfg(test)]
