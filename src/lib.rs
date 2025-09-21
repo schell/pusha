@@ -500,46 +500,50 @@ impl SiteManifest {
             }
         }
 
-        log::info!("done uploading to s3, invalidating the cloudfront cache");
-        let hash = String::from_utf8(
-            std::process::Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .expect("Could not get commit hash")
-                .stdout,
-        )
-        .expect("not utf8");
-        let cf = aws_sdk_cloudfront::Client::new(&config);
-        let paths = invalidate_paths
-            .into_iter()
-            .map(|path| format!("/{}", path.display()))
-            .collect::<Vec<_>>();
-        log::debug!("paths: {paths:#?}");
-        let result = cf
-            .create_invalidation()
-            .distribution_id((cfg.cloudfront_distro)(self.environment).unwrap())
-            .invalidation_batch(
-                aws_sdk_cloudfront::types::InvalidationBatch::builder()
-                    .paths(
-                        aws_sdk_cloudfront::types::Paths::builder()
-                            .quantity(paths.len() as i32)
-                            .set_items(Some(paths))
-                            .build()
-                            .unwrap(),
-                    )
-                    .caller_reference(format!("xtask-{hash}"))
-                    .build()
-                    .unwrap(),
+        if invalidate_paths.is_empty() {
+            log::info!("no files to upload and invalidate, all done.");
+        } else {
+            log::info!("done uploading to s3, invalidating the cloudfront cache");
+            let hash = String::from_utf8(
+                std::process::Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .output()
+                    .expect("Could not get commit hash")
+                    .stdout,
             )
-            .send()
-            .await;
-        match result {
-            Ok(_invalidation) => {
-                log::info!("created invalidation");
-            }
-            Err(e) => {
-                log::error!("{e}");
-                panic!("cloudfront error: {e:#?}");
+            .expect("not utf8");
+            let cf = aws_sdk_cloudfront::Client::new(&config);
+            let paths = invalidate_paths
+                .into_iter()
+                .map(|path| format!("/{}", path.display()))
+                .collect::<Vec<_>>();
+            log::debug!("paths: {paths:#?}");
+            let result = cf
+                .create_invalidation()
+                .distribution_id((cfg.cloudfront_distro)(self.environment).unwrap())
+                .invalidation_batch(
+                    aws_sdk_cloudfront::types::InvalidationBatch::builder()
+                        .paths(
+                            aws_sdk_cloudfront::types::Paths::builder()
+                                .quantity(paths.len() as i32)
+                                .set_items(Some(paths))
+                                .build()
+                                .unwrap(),
+                        )
+                        .caller_reference(format!("xtask-{hash}"))
+                        .build()
+                        .unwrap(),
+                )
+                .send()
+                .await;
+            match result {
+                Ok(_invalidation) => {
+                    log::info!("created invalidation");
+                }
+                Err(e) => {
+                    log::error!("{e}");
+                    panic!("cloudfront error: {e:#?}");
+                }
             }
         }
     }
