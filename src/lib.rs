@@ -6,6 +6,8 @@ use std::{
 
 use clap::{Parser, ValueEnum};
 
+pub mod utils;
+
 #[derive(clap::Subcommand)]
 pub enum Command {
     /// Deploy the site from the `site` directory.
@@ -60,10 +62,6 @@ impl FromStr for Environment {
     }
 }
 
-pub fn md5_bytes(input: &[u8]) -> [u8; 16] {
-    md5::compute(input).0
-}
-
 #[derive(Parser)]
 #[clap(author, version, about)]
 pub struct PushaCli {
@@ -78,29 +76,6 @@ pub struct PushaCli {
     /// Subcommand
     #[clap(subcommand)]
     pub cmd: Command,
-}
-
-fn get_files(dir: impl AsRef<std::path::Path>) -> Vec<std::path::PathBuf> {
-    log::info!("reading directory '{}'", dir.as_ref().display());
-    if !(dir.as_ref().exists() && dir.as_ref().is_dir()) {
-        log::error!(
-            "'{}' does not exist, or is not a directory",
-            dir.as_ref().display()
-        );
-        panic!("not a dir");
-    }
-
-    let mut files = vec![];
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        if path.is_file() {
-            files.push(path);
-        } else if path.is_dir() {
-            files.extend(get_files(path));
-        }
-    }
-    files
 }
 
 fn pop_parent_replace_ext(
@@ -146,13 +121,13 @@ pub struct ExternalPage {
 pub struct SiteConfig {
     /// A mapping of enviornment to URLs that tell the site where
     /// to load things from and what the HREF of links should be.
-    pub root_url: fn(Environment) -> &'static str,
+    pub root_url: Box<dyn Fn(Environment) -> String>,
 
     /// A mapping of environment to AWS cloudfront distributions.
-    pub cloudfront_distro: fn(Environment) -> Option<&'static str>,
+    pub cloudfront_distro: Box<dyn Fn(Environment) -> Option<String>>,
 
     /// A mapping of environment to s3 bucket.
-    pub s3_bucket: fn(Environment) -> Option<&'static str>,
+    pub s3_bucket: Box<dyn Fn(Environment) -> Option<String>>,
 }
 
 pub trait Renderer {
@@ -167,58 +142,64 @@ pub trait Renderer {
     ) -> Result<String, Self::Error>;
 }
 
-#[derive(Clone, Default, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ManifestFile {
-    origin: String,
-    origin_modified: chrono::DateTime<chrono::FixedOffset>,
-    built_filepath: std::path::PathBuf,
-    md5_hash: Option<[u8; 16]>,
-    destination: std::path::PathBuf,
+    pub origin: String,
+    pub origin_modified: chrono::DateTime<chrono::FixedOffset>,
+    pub built_filepath: std::path::PathBuf,
+    pub hash: Option<String>,
+    pub destination: std::path::PathBuf,
 
     /// Whether or not the file still exists.
     ///
     /// This does not get saved to the manifest, so for this to be `true`, the file must
     /// exist on the filesystem and be built.
     #[serde(skip)]
-    exists: bool,
+    pub exists: bool,
     #[serde(skip)]
-    has_changed: bool,
+    pub has_changed: bool,
 }
 
 impl ManifestFile {
-    pub fn set_md5(&mut self, input: &[u8]) {
-        let input = md5_bytes(input);
-        self.has_changed = self.md5_hash.is_none() || self.md5_hash.unwrap() != input;
+    pub fn set_hash(&mut self, contents: &[u8]) {
+        let input = utils::sha256_digest(contents);
+        self.has_changed = self.hash.is_none() || self.hash != input;
         if self.has_changed {
             log::info!(
                 "{} has changed\nprevious: {:?}\ncurrent: {:?}",
                 self.destination.display(),
-                self.md5_hash,
+                self.hash,
                 input
             );
         }
-        self.md5_hash = Some(input);
+        self.hash = input;
     }
 }
 
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SiteManifest {
-    environment: Environment,
-    build_directory: std::path::PathBuf,
-    files: BTreeMap<String, ManifestFile>,
+    pub environment: Environment,
+    pub build_directory: std::path::PathBuf,
+    pub files: BTreeMap<String, ManifestFile>,
+    #[serde(skip, default)]
+    pub save: bool,
 }
 
 impl SiteManifest {
-    fn new(environment: Environment, build_directory: std::path::PathBuf) -> Self {
+    /// Create a new manifest.
+    pub fn new(environment: Environment, build_directory: std::path::PathBuf) -> Self {
         let manifest_path = format!("{}.yaml", environment);
         if let Ok(file) = std::fs::File::open(&manifest_path) {
             log::info!("reading site manifest from {manifest_path}");
-            serde_yaml::from_reader(file).unwrap()
+            let mut s: Self = serde_yaml::from_reader(file).unwrap();
+            s.save = true;
+            s
         } else {
             SiteManifest {
                 environment,
                 build_directory,
                 files: Default::default(),
+                save: true,
             }
         }
     }
@@ -308,12 +289,12 @@ impl SiteManifest {
         file.origin = source_url.as_str().to_owned();
         file.origin_modified = origin_modified;
         file.built_filepath = built_filepath;
-        file.set_md5(page_string.as_bytes());
+        file.set_hash(page_string.as_bytes());
         file.destination = local_path;
         file.exists = true;
     }
 
-    fn build<R: Renderer>(
+    pub fn build<R: Renderer>(
         &mut self,
         cfg: &SiteConfig,
         external_pages: impl IntoIterator<Item = ExternalPage>,
@@ -328,7 +309,7 @@ impl SiteManifest {
             self.build_external::<R>(cfg, external_page);
         }
 
-        let files = get_files(content_dir);
+        let files = utils::get_files(content_dir);
         let (markdown_files, other_files): (Vec<_>, Vec<_>) = files
             .into_iter()
             .partition(|path| path.extension().map(|ext| ext == "md").unwrap_or_default());
@@ -362,7 +343,7 @@ impl SiteManifest {
             file.origin = origin;
             file.origin_modified = origin_modified;
             file.built_filepath = built_filepath;
-            file.set_md5(page_string.as_bytes());
+            file.set_hash(page_string.as_bytes());
             file.destination = destination;
             file.exists = true;
         }
@@ -392,7 +373,7 @@ impl SiteManifest {
             file.origin = origin;
             file.origin_modified = origin_modified;
             file.built_filepath = built_filepath;
-            file.set_md5(&bytes);
+            file.set_hash(bytes.as_slice());
             file.destination = destination;
             file.exists = true;
         }
@@ -406,14 +387,16 @@ impl SiteManifest {
             file.exists
         });
 
-        let manifest_string = serde_yaml::to_string(&self).unwrap();
-        let manifest_path = format!("{}.yaml", self.environment);
-        std::fs::write(&manifest_path, manifest_string).unwrap();
-        log::info!("build manifest saved to '{manifest_path}'");
+        if self.save {
+            let manifest_string = serde_yaml::to_string(&self).unwrap();
+            let manifest_path = format!("{}.yaml", self.environment);
+            std::fs::write(&manifest_path, manifest_string).unwrap();
+            log::info!("build manifest saved to '{manifest_path}'");
+        }
     }
 
     /// Upload one asset.
-    async fn upload(&self, cfg: &SiteConfig, path: std::path::PathBuf, key: String) -> String {
+    pub async fn upload(&self, cfg: &SiteConfig, path: std::path::PathBuf, key: String) -> String {
         let bucket = if let Some(b) = (cfg.s3_bucket)(self.environment) {
             b
         } else {
@@ -472,11 +455,11 @@ impl SiteManifest {
                 ("root url", (cfg.root_url)(self.environment)),
                 (
                     "s3 bucket",
-                    (cfg.s3_bucket)(self.environment).unwrap_or("(none)")
+                    (cfg.s3_bucket)(self.environment).unwrap_or("(none)".to_owned())
                 ),
                 (
                     "cloudfront distribution",
-                    (cfg.cloudfront_distro)(self.environment).unwrap_or("(none)")
+                    (cfg.cloudfront_distro)(self.environment).unwrap_or("(none)".to_owned())
                 ),
             ]
         );
@@ -503,7 +486,6 @@ impl SiteManifest {
         if invalidate_paths.is_empty() {
             log::info!("no files to upload and invalidate, all done.");
         } else {
-            log::info!("done uploading to s3, invalidating the cloudfront cache");
             let hash = String::from_utf8(
                 std::process::Command::new("git")
                     .args(["rev-parse", "HEAD"])
@@ -512,38 +494,51 @@ impl SiteManifest {
                     .stdout,
             )
             .expect("not utf8");
-            let cf = aws_sdk_cloudfront::Client::new(&config);
-            let paths = invalidate_paths
-                .into_iter()
-                .map(|path| format!("/{}", path.display()))
-                .collect::<Vec<_>>();
-            log::debug!("paths: {paths:#?}");
-            let result = cf
-                .create_invalidation()
-                .distribution_id((cfg.cloudfront_distro)(self.environment).unwrap())
-                .invalidation_batch(
-                    aws_sdk_cloudfront::types::InvalidationBatch::builder()
-                        .paths(
-                            aws_sdk_cloudfront::types::Paths::builder()
-                                .quantity(paths.len() as i32)
-                                .set_items(Some(paths))
-                                .build()
-                                .unwrap(),
-                        )
-                        .caller_reference(format!("xtask-{hash}"))
-                        .build()
-                        .unwrap(),
-                )
-                .send()
-                .await;
-            match result {
-                Ok(_invalidation) => {
-                    log::info!("created invalidation");
-                }
-                Err(e) => {
-                    log::error!("{e}");
-                    panic!("cloudfront error: {e:#?}");
-                }
+            self.invalidate(cfg, &config, hash, invalidate_paths).await;
+        }
+    }
+
+    /// Invalidate the given paths on cloudfront.
+    pub async fn invalidate(
+        &self,
+        cfg: &SiteConfig,
+        config: &aws_config::SdkConfig,
+        hash: impl AsRef<str>,
+        invalidate_paths: Vec<std::path::PathBuf>,
+    ) {
+        log::info!("done uploading to s3, invalidating the cloudfront cache");
+
+        let cf = aws_sdk_cloudfront::Client::new(config);
+        let paths = invalidate_paths
+            .into_iter()
+            .map(|path| format!("/{}", path.display()))
+            .collect::<Vec<_>>();
+        log::debug!("paths: {paths:#?}");
+        let result = cf
+            .create_invalidation()
+            .distribution_id((cfg.cloudfront_distro)(self.environment).unwrap())
+            .invalidation_batch(
+                aws_sdk_cloudfront::types::InvalidationBatch::builder()
+                    .paths(
+                        aws_sdk_cloudfront::types::Paths::builder()
+                            .quantity(paths.len() as i32)
+                            .set_items(Some(paths))
+                            .build()
+                            .unwrap(),
+                    )
+                    .caller_reference(format!("xtask-{}", hash.as_ref()))
+                    .build()
+                    .unwrap(),
+            )
+            .send()
+            .await;
+        match result {
+            Ok(_invalidation) => {
+                log::info!("created invalidation");
+            }
+            Err(e) => {
+                log::error!("{e}");
+                panic!("cloudfront error: {e:#?}");
             }
         }
     }
