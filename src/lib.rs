@@ -165,7 +165,7 @@ impl ManifestFile {
         let input = utils::sha256_digest(contents);
         self.has_changed = self.hash.is_none() || self.hash != input;
         if self.has_changed {
-            log::info!(
+            log::trace!(
                 "{} has changed\nprevious: {:?}\ncurrent: {:?}",
                 self.destination.display(),
                 self.hash,
@@ -205,7 +205,7 @@ impl SiteManifest {
     }
 
     fn clean(&mut self) {
-        log::info!("cleaning '{}'", self.build_directory.display());
+        log::debug!("cleaning '{}'", self.build_directory.display());
         if self.build_directory.is_dir() {
             log::debug!("removing build dir '{}'", self.build_directory.display());
             std::fs::remove_dir_all(&self.build_directory).unwrap();

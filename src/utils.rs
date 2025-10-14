@@ -25,7 +25,7 @@ pub fn sha256_digest(contents: &[u8]) -> Option<String> {
 
 /// Recursively get the files within a directory.
 pub fn get_files(dir: impl AsRef<std::path::Path>) -> Vec<std::path::PathBuf> {
-    log::info!("reading directory '{}'", dir.as_ref().display());
+    log::debug!("reading directory '{}'", dir.as_ref().display());
     if !(dir.as_ref().exists() && dir.as_ref().is_dir()) {
         log::error!(
             "'{}' does not exist, or is not a directory",
